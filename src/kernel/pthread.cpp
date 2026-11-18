@@ -390,6 +390,7 @@ struct PthreadPrivate {
 	std::atomic_bool      detached;
 	std::atomic_bool      almost_done;
 	std::atomic_bool      free;
+	std::atomic_bool      cancel_requested {false};
 	uint64_t              host_thread_id;
 	uintptr_t             guest_host_rbx;
 	uintptr_t             guest_host_rsp;
@@ -1513,7 +1514,8 @@ Pthread PthreadPool::Create() {
 
 	for (auto* p: m_threads) {
 		if (p->free) {
-			p->free = false;
+			p->free             = false;
+			p->cancel_requested = false;
 			return p;
 		}
 	}
@@ -3370,6 +3372,57 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// winpthreads exits a canceled thread with longjmp, which unwinds with RtlUnwindEx. On the guest
+// stack the TEB stack limits are zero and the stack switch has no unwind data, so that unwind fails
+// with STATUS_BAD_STACK. Kyty therefore never passes a cancel to winpthreads; it keeps the request
+// in cancel_requested and leaves through PthreadExit, which returns to the host stack first.
+// winpthreads still stores the cancel state and type. A cancel of another thread acts only when
+// that thread calls PthreadTestcancel, PthreadSetcancelstate or PthreadSetcanceltype.
+
+// A cancel acts only on the thread itself while it runs guest code. A created thread off its guest
+// stack is already exiting (CleanupThread), and a signal helper thread borrows another thread's
+// self. The main thread runs guest code without a guest entry frame.
+static bool CanActOnCancel() {
+	const auto* self = g_pthread_self;
+	if (self == nullptr || self->host_thread_id != GetCurrentThreadId()) {
+		return false;
+	}
+	return g_guest_entry_return_rsp != 0 || self == g_pthread_main;
+}
+
+// Exits the calling thread if a cancel was requested and cancellation is enabled. Cancellation
+// stays disabled while the thread exits, as POSIX requires.
+static void ActOnRequestedCancel() {
+	if (!CanActOnCancel() || !g_pthread_self->cancel_requested) {
+		return;
+	}
+	int state = PTHREAD_CANCEL_DISABLE;
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state);
+	if (state != PTHREAD_CANCEL_ENABLE) {
+		pthread_setcancelstate(state, nullptr);
+		return;
+	}
+	g_pthread_self->cancel_requested = false;
+	PthreadExit(PTHREAD_CANCELED);
+}
+
+static bool IsCancelAsynchronous() {
+	int type     = PTHREAD_CANCEL_DEFERRED;
+	int restored = PTHREAD_CANCEL_DEFERRED;
+	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &type);
+	pthread_setcanceltype(type, &restored);
+	return type == PTHREAD_CANCEL_ASYNCHRONOUS;
+}
+
+// An asynchronous cancel acts as soon as it is both requested and enabled.
+static void ActOnAsynchronousCancel() {
+	if (CanActOnCancel() && g_pthread_self->cancel_requested && IsCancelAsynchronous()) {
+		ActOnRequestedCancel();
+	}
+}
+#endif
+
 int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 	PRINT_NAME();
 
@@ -3382,6 +3435,19 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Kyty acts on the request itself; see ActOnRequestedCancel. The target acts on it only when it
+	// calls PthreadTestcancel, PthreadSetcancelstate or PthreadSetcanceltype, so guest waits are
+	// not cancellation points on Windows.
+	thread->cancel_requested = true;
+
+	LOGF("\tthread cancel: %s\n", thread->name.c_str());
+
+	if (thread == g_pthread_self) {
+		ActOnAsynchronousCancel();
+	}
+	return OK;
+#else
 	int result = pthread_cancel(thread->p);
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
@@ -3391,6 +3457,7 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		case ESRCH: return KERNEL_ERROR_ESRCH;
 		default: return KERNEL_ERROR_EINVAL;
 	}
+#endif
 }
 
 int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
@@ -3442,6 +3509,9 @@ int KYTY_SYSV_ABI PthreadSetcancelstate(int state, int* old_state) {
 	}
 
 	if (result == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		ActOnAsynchronousCancel();
+#endif
 		return OK;
 	}
 	return KERNEL_ERROR_EINVAL;
@@ -3471,6 +3541,9 @@ int KYTY_SYSV_ABI PthreadSetcanceltype(int type, int* old_type) {
 	}
 
 	if (result == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		ActOnAsynchronousCancel();
+#endif
 		return OK;
 	}
 	return KERNEL_ERROR_EINVAL;
@@ -3537,7 +3610,11 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 void KYTY_SYSV_ABI PthreadTestcancel() {
 	PRINT_NAME();
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	ActOnRequestedCancel();
+#else
 	pthread_testcancel();
+#endif
 }
 
 void KYTY_SYSV_ABI PthreadExit(void* value) {
